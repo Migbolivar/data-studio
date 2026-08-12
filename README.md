@@ -2,7 +2,7 @@
 
 AI-powered data analysis platform: upload CSV/Excel → dynamic KPIs of the active filter → LLM analysis with **3 insights + conclusion + recommendation** — grounded in real computed metrics (no hallucination).
 
-**Live demo:** https://finance.bmops.tech (AI Finance Advisor)
+**Live demo:** https://devwebhook.bmops.tech/data-studio
 
 ## Why it matters
 Most "AI analytics" tools let the LLM guess. This one **computes metrics with Pandas first**, then the LLM only *translates* those real numbers into insights — with a hard rule: every insight must cite a concrete computed value.
