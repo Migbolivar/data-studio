@@ -281,6 +281,72 @@ def qualitative_insights(df: pd.DataFrame) -> dict:
 # 3. ORQUESTADOR
 # ─────────────────────────────────────────────────────────────
 
+def descriptive_insights(df: pd.DataFrame) -> dict:
+    """Estadística descriptiva para datasets sin fecha ni entidad de agrupación.
+
+    El clásico caso "wine.csv": 13 variables numéricas y una clase 1/2/3. Antes
+    caía en la rama financiera, no calculaba nada y la IA inventaba ventas.
+    """
+    numeric = df.select_dtypes(include=[np.number])
+    features = []
+    for col in list(numeric.columns)[:20]:
+        serie = pd.to_numeric(numeric[col], errors="coerce").dropna()
+        if serie.empty:
+            continue
+        media = float(serie.mean())
+        std = float(serie.std(ddof=0))
+        features.append({
+            "name": str(col),
+            "mean": round(media, 4),
+            "std": round(std, 4),
+            "min": round(float(serie.min()), 4),
+            "max": round(float(serie.max()), 4),
+            "cv": round(std / abs(media), 4) if media else 0.0,
+        })
+
+    categorical = []
+    for col in df.columns:
+        serie = df[col].dropna()
+        if serie.empty:
+            continue
+        unicos = serie.nunique()
+        es_cat = serie.dtype == object or pd.api.types.is_integer_dtype(serie) or pd.api.types.is_bool_dtype(serie)
+        if not es_cat and pd.api.types.is_numeric_dtype(serie) and unicos <= 12:
+            # class=1/2/3 llega como float desde el navegador: sigue siendo categoría
+            valores = pd.to_numeric(serie, errors="coerce").dropna()
+            es_cat = bool((valores % 1 == 0).all())
+        if es_cat and 2 <= unicos <= 12:
+            conteo = serie.value_counts().head(12)
+            total = int(conteo.sum())
+            categorical.append({
+                "name": str(col),
+                "counts": {str(k): int(v) for k, v in conteo.items()},
+                "share_pct": {str(k): round(v * 100 / total, 1) for k, v in conteo.items()},
+            })
+
+    group_means = []
+    for cat in categorical[:2]:
+        for feat in sorted(features, key=lambda f: -f["cv"])[:3]:
+            try:
+                g = df.groupby(cat["name"])[feat["name"]].mean()
+                group_means.append({
+                    "category_col": cat["name"],
+                    "feature": feat["name"],
+                    "means": {str(k): round(float(v), 4) for k, v in g.items()},
+                })
+            except Exception:
+                continue
+
+    return {
+        "n_rows": int(len(df)),
+        "n_features": len(features),
+        "features": features,
+        "categorical": categorical,
+        "group_means": group_means,
+        "missing_pct": round(float(df.isna().mean().mean()) * 100, 2),
+    }
+
+
 def generate_insights(df: pd.DataFrame, filters: dict = None, total_count: int = None) -> dict:
     """Punto de entrada único: recibe el DataFrame y devuelve métricas + prompt listo.
     Auto-detecta el tipo de datos (financiero/cuantitativo/cualitativo)."""
@@ -290,6 +356,34 @@ def generate_insights(df: pd.DataFrame, filters: dict = None, total_count: int =
         value_col = _detect_value_column(df)
         entity_col = _detect_entity_column(df, value_col)
         date_col = _detect_date_column(df)
+
+        if date_col is None and entity_col is None:
+            # Sin fechas ni entidades no hay serie temporal ni concentración:
+            # se describe el dataset con estadística, sin inventar negocio.
+            data_type = "descriptive"
+            metrics = {
+                "data_type": data_type,
+                "detected_columns": {"value_column": value_col, "entity_column": None, "date_column": None},
+                "filtered_count": len(df),
+                "total_unfiltered": total_count or len(df),
+                "has_filters": bool(filters and len(filters) > 0),
+                "filters": filters or {},
+                "descriptive": descriptive_insights(df),
+                "concentration": None, "anomaly": None, "trend": None, "actionable_delta": None,
+            }
+            return {
+                "entity_column": None,
+                "value_column": value_col,
+                "total_entities": 0,
+                "top_20pct_count": 0,
+                "top_20pct_share_of_value": 0.0,
+                "top3_entities": [],
+                "top3_share_of_value": 0.0,
+                "is_high_risk": False,
+                "data_type": data_type,
+                "metrics": metrics,
+                "prompt": build_interpretation_prompt(metrics, filters, total_count),
+            }
 
         metrics = {
             "data_type": data_type,
@@ -334,6 +428,19 @@ def _format_metric_summary(metrics: dict) -> str:
     """Extrae los números clave de las métricas para que la IA los cite."""
     parts = []
     data_type = metrics.get("data_type", "financial")
+
+    if data_type == "descriptive":
+        desc = metrics.get("descriptive", {})
+        parts.append(f"📊 Dataset: {desc.get('n_rows', 0)} filas · {desc.get('n_features', 0)} variables numéricas · faltantes {desc.get('missing_pct', 0)}%")
+        for f in desc.get("features", [])[:6]:
+            parts.append(f"📊 '{f['name']}': media={f['mean']} · desv={f['std']} · min={f['min']} · max={f['max']} · CV={f['cv']}")
+        for c in desc.get("categorical", [])[:3]:
+            reparto = ", ".join(f"{k}={v} ({c['share_pct'][k]}%)" for k, v in c["counts"].items())
+            parts.append(f"📊 Grupos de '{c['name']}': {reparto}")
+        for g in desc.get("group_means", [])[:4]:
+            medias = ", ".join(f"{k}={v}" for k, v in g["means"].items())
+            parts.append(f"📊 Media de '{g['feature']}' por '{g['category_col']}': {medias}")
+        return "\n".join(parts)
 
     if data_type == "qualitative":
         qual = metrics.get("qualitative", {})
@@ -385,6 +492,32 @@ def build_interpretation_prompt(metrics: dict, filters: dict = None, total_count
 
     # Resumen de métricas para que la IA las cite textualmente
     metric_summary = _format_metric_summary(metrics)
+
+    if data_type == "descriptive":
+        return f"""Eres un analista de datos senior. Este dataset NO tiene fechas, clientes ni importes:
+es un conjunto de variables numéricas (posible dataset técnico o científico).
+
+MÉTRICAS CALCULADAS (DEBES citar estos números textualmente en cada insight):
+{metric_summary}
+{filter_info}
+
+REGLAS ESTRICTAS:
+- NO inventes contexto de negocio: prohibido hablar de ventas, clientes, pedidos, tickets o meses si no aparecen en las métricas.
+- Cada insight DEBE contener al menos un número exacto de las métricas de arriba.
+- Si agrupas, usa los nombres de columna tal cual (por ejemplo 'class').
+- Máximo 4 líneas por insight.
+
+ESTRUCTURA EXACTA DE RESPUESTA:
+
+1. 🔍 [Hallazgo con número concreto sobre la distribución de una variable]
+2. 🔍 [Hallazgo con número concreto comparando grupos, si existen]
+3. 🔍 [Hallazgo con número concreto sobre dispersión, valores extremos o desbalance]
+
+al analizar los insights la conclusión es que [conclusión de mínimo 150 palabras usando solo los números calculados: qué variables discriminan más, cómo se reparten los grupos y qué limitaciones tiene el dataset]
+
+como recomendación [recomendación de mínimo 150 palabras con 3 análisis o acciones concretas sobre estos datos: qué comparar, qué modelar y qué verificar antes de sacar conclusiones]
+
+FIN DEL ANÁLISIS"""
 
     if data_type == "qualitative":
         return f"""Eres un analista de datos senior. Analiza esta encuesta o dataset cualitativo.

@@ -9,6 +9,7 @@
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="/chart-specs.js"></script>
 <script>tailwind.config={darkMode:'class',theme:{extend:{colors:{brand:{50:'#eef2ff',100:'#e0e7ff',500:'#6366f1',600:'#4f46e5',700:'#4338ca'},surface:'#0a0a0f',card:'#111118',border:'#1e1e2e',muted:'#a0a0b8',head:'#e8e8f0'},fontFamily:{sans:['Inter','system-ui','sans-serif']}}}}</script>
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
@@ -271,9 +272,14 @@ async function handleFile(file) {
     
     allRows = rows;
     columns = Object.keys(rows[0]);
+    // archivo nuevo: los filtros del anterior no pueden seguir aplicándose
+    activeFilters = {};
+    currentPage = 1;
+    sortCol = null;
     
-    // Detect column types
+    // Detect column types (motor propio para navegador y motor de gráficos)
     detectColumnTypes(rows);
+    columnTypes = ChartSpecs.detectTypes(rows, columns);
     
     // Build UI
     buildKPIs();
@@ -364,10 +370,14 @@ function buildKPIs() {
     const vals = filtered.map(r => parseFloat(String(r[col]).replace(/[^0-9.,-]/g,'')) || 0);
     const sum = vals.reduce((a,b) => a+b, 0);
     const avg = vals.length ? sum / vals.length : 0;
-    kpis.push({ icon: '💰', label: hasFilter ? `Total ${col} (filtrado)` : `Total ${col}`, value: sum, fmt: 'money', color: '#22c55e' });
-    kpis.push({ icon: '📊', label: hasFilter ? `Promedio (filtrado)` : `Promedio ${col}`, value: avg, fmt: 'money', color: '#3b82f6' });
-    kpis.push({ icon: '📈', label: hasFilter ? `Máx (filtrado)` : `Máx ${col}`, value: Math.max(...vals), fmt: 'money', color: '#f59e0b' });
-    kpis.push({ icon: '📉', label: hasFilter ? `Mín (filtrado)` : `Mín ${col}`, value: Math.min(...vals), fmt: 'money', color: '#ef4444' });
+    // Solo es dinero si el nombre de la columna lo dice (Alcohol no es moneda)
+    const moneyLike = /total|monto|venta|revenue|amount|precio|valor|importe|sales|price|ingreso|pago|costo|coste/i.test(col);
+    const fmt = moneyLike ? 'money' : 'num';
+    const icon = moneyLike ? '💰' : '🔢';
+    kpis.push({ icon: icon, label: hasFilter ? `Suma ${col} (filtrado)` : `Suma ${col}`, value: sum, fmt: fmt, color: '#22c55e' });
+    kpis.push({ icon: '📊', label: hasFilter ? `Media (filtrado)` : `Media ${col}`, value: avg, fmt: fmt, color: '#3b82f6' });
+    kpis.push({ icon: '📈', label: hasFilter ? `Máx (filtrado)` : `Máx ${col}`, value: Math.max(...vals), fmt: fmt, color: '#f59e0b' });
+    kpis.push({ icon: '📉', label: hasFilter ? `Mín (filtrado)` : `Mín ${col}`, value: Math.min(...vals), fmt: fmt, color: '#ef4444' });
   }
   
   row.innerHTML = kpis.slice(0,6).map(k => `
@@ -383,6 +393,7 @@ function buildKPIs() {
 
 function formatValue(v, fmt) {
   if (fmt === 'int') return v.toLocaleString('es-VE');
+  if (fmt === 'num') return v.toLocaleString('es-ES', {minimumFractionDigits:0, maximumFractionDigits:2});
   if (fmt === 'money') {
     if (Math.abs(v) >= 1e6) return '$' + (v/1e6).toFixed(1) + 'M';
     return '$' + v.toLocaleString('es-VE', {minimumFractionDigits:0,maximumFractionDigits:2});
@@ -393,32 +404,77 @@ function formatValue(v, fmt) {
 // === FILTERS ===
 function buildFilters() {
   const container = document.getElementById('filterChips');
-  let html = '<span class="text-muted text-xs mr-2">Filtros:</span>';
-  
-  // Text columns become filter chips
-  textCols.filter(c => {
-    const unique = new Set(allRows.map(r => r[c]).filter(Boolean));
-    return unique.size <= 20 && unique.size > 1;
-  }).slice(0, 5).forEach(col => {
-    const unique = [...new Set(allRows.map(r => r[col]).filter(Boolean))].sort();
-    html += `<span class="text-muted text-xs mx-1">${col}:</span>`;
-    html += `<select class="text-xs py-1" onchange="applyFilter('${col}', this.value)" id="filter_${col.replace(/[^a-zA-Z0-9]/g,'_')}">
-      <option value="">Todos</option>
-      ${unique.map(v => `<option value="${v}">${String(v).substring(0,30)}</option>`).join('')}
-    </select>`;
-  });
-  
-  if (dateCols.length > 0) {
-    html += `<button onclick="clearFilters()" class="btn-ghost text-xs ml-2">Limpiar filtros</button>`;
+  if (typeof ChartSpecs === 'undefined' || !allRows.length) return;
+  const types = columnTypes || ChartSpecs.detectTypes(allRows, columns);
+  const defs = ChartSpecs.buildFilterDefs(allRows, columns, types);
+  const activos = Object.keys(activeFilters).length;
+
+  if (!defs.length) {
+    container.innerHTML = '<span class="text-muted text-xs">Este archivo no tiene columnas agrupables para filtrar.</span>';
+    return;
   }
-  
+
+  let html = `<span class="text-muted text-xs mr-2">Filtros${activos ? ` <span class="badge badge-info">${activos}</span>` : ''}:</span>`;
+  const inputStyle = 'width:78px;padding:2px 6px;border-radius:6px;border:1px solid #2a2a3a;background:#14141c;color:#e8e8f0;font-size:.72rem';
+
+  defs.forEach(def => {
+    const safe = String(def.col).replace(/'/g, "\\'");
+    const id = 'filter_' + def.col.replace(/[^a-zA-Z0-9]/g, '_');
+
+    if (def.kind === 'select') {
+      html += `<span class="text-muted text-xs mx-1">${def.col}:</span>
+        <select class="text-xs py-1" id="${id}" onchange="applyFilter('${safe}', this.value)">
+          <option value="">Todos</option>
+          ${def.options.map(o => `<option value="${o.value}"${String(activeFilters[def.col]) === String(o.value) ? ' selected' : ''}>${o.label} (${o.n})</option>`).join('')}
+        </select>`;
+
+    } else if (def.kind === 'range') {
+      const f = activeFilters[def.col] || {};
+      const min = (f && f.min !== undefined) ? f.min : '';
+      const max = (f && f.max !== undefined) ? f.max : '';
+      html += `<span class="text-muted text-xs mx-1">${def.col}:</span>
+        <input type="number" step="any" id="${id}_min" placeholder="${Math.round(def.min * 100) / 100}" value="${min}" style="${inputStyle}"
+               onchange="applyRange('${safe}', this.value, document.getElementById('${id}_max').value)">
+        <span class="text-muted text-xs">–</span>
+        <input type="number" step="any" id="${id}_max" placeholder="${Math.round(def.max * 100) / 100}" value="${max}" style="${inputStyle}"
+               onchange="applyRange('${safe}', document.getElementById('${id}_min').value, this.value)">`;
+
+    } else if (def.kind === 'date') {
+      const f = activeFilters[def.col] || {};
+      html += `<span class="text-muted text-xs mx-1">${def.col}:</span>
+        <input type="date" id="${id}_from" value="${f.from || ''}" style="${inputStyle}"
+               onchange="applyRange('${safe}', this.value, document.getElementById('${id}_to').value)">
+        <span class="text-muted text-xs">→</span>
+        <input type="date" id="${id}_to" value="${f.to || ''}" style="${inputStyle}"
+               onchange="applyRange('${safe}', document.getElementById('${id}_from').value, this.value)">`;
+    }
+  });
+
+  if (activos) {
+    html += `<button onclick="clearFilters()" class="btn-ghost text-xs ml-2">✕ Limpiar filtros</button>`;
+  }
+
   container.innerHTML = html;
+}
+
+function applyRange(col, min, max) {
+  if ((min === '' || min === null || min === undefined) && (max === '' || max === null || max === undefined)) {
+    delete activeFilters[col];
+  } else {
+    activeFilters[col] = { min, max };
+  }
+  currentPage = 1;
+  buildFilters();
+  buildKPIs();
+  buildCharts();
+  renderTable();
 }
 
 function applyFilter(col, val) {
   if (val) activeFilters[col] = val;
   else delete activeFilters[col];
   currentPage = 1;
+  buildFilters();
   buildKPIs();
   buildCharts();
   renderTable();
@@ -426,14 +482,17 @@ function applyFilter(col, val) {
 
 function clearFilters() {
   activeFilters = {};
-  document.querySelectorAll('#filterChips select').forEach(s => s.value = '');
   currentPage = 1;
+  buildFilters();
   buildKPIs();
   buildCharts();
   renderTable();
 }
 
 function getFilteredRows() {
+  if (typeof ChartSpecs !== 'undefined' && ChartSpecs.applyFilters) {
+    return ChartSpecs.applyFilters(allRows, activeFilters);
+  }
   return allRows.filter(r => {
     for (let [col, val] of Object.entries(activeFilters)) {
       if (String(r[col] || '') !== val) return false;
@@ -447,123 +506,30 @@ function buildCharts() {
   charts.forEach(c => c.destroy());
   charts = [];
   const filtered = getFilteredRows();
-  
-  // Chart 1: Bar/Column distribution
-  if (textCols.length > 0) {
-    const col = textCols.find(c => {
-      const unique = new Set(filtered.map(r => r[c]).filter(Boolean));
-      return unique.size >= 2 && unique.size <= 15;
-    }) || textCols[0];
-    
-    const counts = {};
-    filtered.forEach(r => { const v = r[col] || 'N/A'; counts[v] = (counts[v]||0)+1; });
-    const entries = Object.entries(counts).sort((a,b) => b[1]-a[1]).slice(0, 12);
-    
-    document.getElementById('chart1Title').textContent = `Distribución por ${col}`;
-    const ctx = document.getElementById('chart1').getContext('2d');
-    charts.push(new Chart(ctx, {
-      type: 'bar',
-      data: {
-        labels: entries.map(e => String(e[0]).substring(0,20)),
-        datasets: [{label:'Cantidad',data:entries.map(e=>e[1]),
-          backgroundColor: entries.map((_,i) => `hsla(${250+i*15},70%,65%,0.7)`),
-          borderColor: entries.map((_,i) => `hsl(${250+i*15},70%,65%)`),
-          borderWidth:1,borderRadius:6}]
-      },
-      options: {
-        responsive:true,maintainAspectRatio:false,
-        plugins:{legend:{display:false}},
-        scales:{x:{grid:{display:false},ticks:{color:'#a0a0b8',maxRotation:45}},y:{grid:{color:'rgba(30,30,46,0.5)'},ticks:{color:'#a0a0b8'}}}
-      }
-    }));
-  }
-  
-  // Chart 2: Time series (if date cols)
-  if (dateCols.length > 0) {
-    const col = dateCols[0];
-    const byDate = {};
-    filtered.forEach(r => {
-      let d = r[col];
-      if (typeof d === 'number') d = new Date((d-25569)*86400*1000).toISOString().slice(0,10);
-      else { const p = new Date(d); if (!isNaN(p)) d = p.toISOString().slice(0,10); }
-      if (d) byDate[d] = (byDate[d]||0)+1;
-    });
-    const entries = Object.entries(byDate).sort();
-    
-    document.getElementById('chart2Title').textContent = `Tendencia temporal (${col})`;
-    const ctx = document.getElementById('chart2').getContext('2d');
-    charts.push(new Chart(ctx, {
-      type: 'line',
-      data: {
-        labels: entries.map(e=>e[0]),
-        datasets:[{label:'Registros',data:entries.map(e=>e[1]),
-          borderColor:'#6366f1',backgroundColor:'rgba(99,102,241,0.1)',fill:true,tension:0.4,pointRadius:3,pointBackgroundColor:'#6366f1'}]
-      },
-      options: {
-        responsive:true,maintainAspectRatio:false,
-        plugins:{legend:{display:false}},
-        scales:{x:{grid:{display:false},ticks:{color:'#a0a0b8',maxTicksLimit:10,maxRotation:45}},y:{grid:{color:'rgba(30,30,46,0.5)'},ticks:{color:'#a0a0b8'}}}
-      }
-    }));
-  } else if (numericCols.length > 0) {
-    // Fallback: histogram
-    const col = numericCols[0];
-    const vals = filtered.map(r => parseFloat(String(r[col]).replace(/[^0-9.,-]/g,''))||0).filter(v=>!isNaN(v));
-    const min=Math.min(...vals),max=Math.max(...vals),bins=8,step=(max-min)/bins||1;
-    const buckets=Array(bins).fill(0);
-    vals.forEach(v=>{const i=Math.min(Math.floor((v-min)/step),bins-1);buckets[i]++;});
-    
-    document.getElementById('chart2Title').textContent = `Distribución de ${col}`;
-    const ctx=document.getElementById('chart2').getContext('2d');
-    charts.push(new Chart(ctx,{
-      type:'bar',
-      data:{labels:Array.from({length:bins},(_,i)=>formatValue(min+i*step,'money')),datasets:[{label:'Frecuencia',data:buckets,backgroundColor:'rgba(99,102,241,0.6)',borderRadius:6}]},
-      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false},ticks:{color:'#a0a0b8',maxRotation:45}},y:{grid:{color:'rgba(30,30,46,0.5)'},ticks:{color:'#a0a0b8'}}}}
-    }));
-  }
-  
-  // Chart 3: Pie/Doughnut
-  if (textCols.length > 0) {
-    const col = textCols.find(c => {
-      const unique = new Set(filtered.map(r => r[c]).filter(Boolean));
-      return unique.size >= 2 && unique.size <= 8 && c !== (textCols[0]);
-    }) || textCols[0];
-    
-    const counts = {};
-    filtered.forEach(r => { const v = r[col] || 'N/A'; counts[v] = (counts[v]||0)+1; });
-    const entries = Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0,8);
-    
-    document.getElementById('chart3Title').textContent = `Composición por ${col}`;
-    const ctx = document.getElementById('chart3').getContext('2d');
-    const colors = entries.map((_,i) => `hsla(${i*45},70%,60%,0.8)`);
-    charts.push(new Chart(ctx,{
-      type:'doughnut',
-      data:{labels:entries.map(e=>String(e[0]).substring(0,18)),datasets:[{data:entries.map(e=>e[1]),backgroundColor:colors,borderColor:'#111118',borderWidth:2}]},
-      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{color:'#a0a0b8',padding:12,font:{size:11}}}}}
-    }));
-  }
-  
-  // Chart 4: Horizontal bar (top values)
-  if (numericCols.length >= 1 && textCols.length >= 1) {
-    const numCol = numericCols[0];
-    const catCol = textCols[0];
-    const grouped = {};
-    filtered.forEach(r => {
-      const cat = r[catCol] || 'N/A';
-      const val = parseFloat(String(r[numCol]).replace(/[^0-9.,-]/g,'')) || 0;
-      grouped[cat] = (grouped[cat]||0)+val;
-    });
-    const entries = Object.entries(grouped).sort((a,b)=>b[1]-a[1]).slice(0,10);
-    
-    document.getElementById('chart4Title').textContent = `Top 10: ${numCol} por ${catCol}`;
-    const ctx = document.getElementById('chart4').getContext('2d');
-    charts.push(new Chart(ctx,{
-      type:'bar',
-      data:{labels:entries.map(e=>String(e[0]).substring(0,20)),datasets:[{label:numCol,data:entries.map(e=>e[1]),
-        backgroundColor:'rgba(99,102,241,0.7)',borderRadius:6}]},
-      options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:'rgba(30,30,46,0.5)'},ticks:{color:'#a0a0b8'}},y:{grid:{display:false},ticks:{color:'#a0a0b8'}}}}
-    }));
-  }
+  if (!filtered.length || typeof ChartSpecs === 'undefined') return;
+
+  // Detección propia: reconoce como categoría una columna numérica de pocos
+  // valores (class = 1/2/3), que antes se trataba como numérica y dejaba
+  // tres de los cuatro gráficos sin pintar.
+  const types = ChartSpecs.detectTypes(filtered, columns);
+  const specs = ChartSpecs.buildChartSpecs({ rows: filtered, columns, types });
+  const byId = new Map(specs.map(sp => [sp.id, sp]));
+
+  ['chart1', 'chart2', 'chart3', 'chart4'].forEach(id => {
+    const canvas = document.getElementById(id);
+    if (!canvas) return;
+    const card = canvas.closest('.card');
+    const spec = byId.get(id);
+    if (!spec) { if (card) card.style.display = 'none'; return; }
+    if (card) card.style.display = '';
+    const title = document.getElementById(id + 'Title');
+    if (title) title.textContent = spec.title;
+    const cfg = Object.assign({}, spec.config);
+    cfg.plugins = (cfg.plugins || []).concat([ChartSpecs.dataLabelsPlugin]);
+    cfg.options = cfg.options || {};
+    cfg.options.layout = Object.assign({ padding: { top: 16 } }, cfg.options.layout || {});
+    charts.push(new Chart(canvas.getContext('2d'), cfg));
+  });
 }
 
 // === TABLE ===
@@ -779,7 +745,11 @@ async function analyzeChart(title, labels, values) {
     });
     var d = await r.json();
     if(d.analysis) {
-      document.getElementById('analysisContent').innerHTML = '<div class="analysis-text">'+d.analysis.replace(/\n/g,'<br>')+'</div>';
+      const limpio = d.analysis
+        .replace(/^\s*(\*\*)?[1-9](?:\uFE0F?\u20E3)?\.?(\*\*)?[\s.)]*/gm, '• ')
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\n/g, '<br>');
+      document.getElementById('analysisContent').innerHTML = '<div class="analysis-text">' + limpio + '</div>';
     } else {
       document.getElementById('analysisContent').innerHTML = '<div style="color:#ef4444">Error: '+(d.error||'desconocido')+'</div>';
     }

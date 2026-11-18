@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
+import os
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 """BMOPS Dashboard Pro — Servidor con Sidebar AI"""
 import http.server, urllib.request, urllib.error, urllib.parse, json, socket
+import re
 from datetime import datetime, date
 import pandas as pd
 import sys
-sys.path.insert(0, "/root/bmops-dashboard-v2")
 from insight_engine import generate_insights
 
 PORT = 8704
@@ -109,6 +111,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             resp = json.loads(urllib.request.urlopen(req, timeout=60).read())
             return resp["choices"][0]["message"]["content"]
 
+
+    @staticmethod
+    def _pretty_analysis(html: str) -> str:
+        """Limpia el markdown que devuelve el modelo: numeración decorativa y **negritas**."""
+        html = re.sub(r"(?m)^\s*(?:\*\*)?[1-9](?:\uFE0F?\u20E3)?\.?(?:\*\*)?[\s.)]*", "• ", html)
+        html = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", html, flags=re.S)
+        html = re.sub(r"(?<![\w*])\*([^*\n]{2,80})\*(?![\w*])", r"<em>\1</em>", html)
+        return html
+
     def _json(self, code, data):
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(code)
@@ -123,18 +134,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
         
-        if path.rstrip("/") in ("/data-studio", "/studio"):
+        if path.rstrip("/") in ("", "/data-studio", "/studio"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            with open("/root/bmops_data_studio.html", "rb") as f:
+            with open(os.path.join(BASE_DIR, "index.html"), "rb") as f:
                 self.wfile.write(f.read())
             return
         
+        if path in ("/chart-specs.js",):
+            fn = os.path.basename(path)
+            try:
+                with open(os.path.join(BASE_DIR, fn), "rb") as f:
+                    body = f.read()
+            except OSError:
+                self.send_response(404); self.end_headers(); return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "public, max-age=60")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if path.startswith("/datasets/"):
             filename = path.split("/datasets/", 1)[-1]
             try:
-                with open(f"/root/datasets_demo/{filename}", "rb") as f:
+                with open(os.path.join(BASE_DIR, "datasets", filename), "rb") as f:
                     self.send_response(200)
                     self.send_header("Content-Type", "text/csv")
                     self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
@@ -149,7 +175,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/favicon.ico":
             self.send_response(204); self.end_headers(); return
         
-        # Dashboard monitoring
+        if path.rstrip("/") != "/monitor":
+            self.send_response(404); self.end_headers(); self.wfile.write(b"Not found"); return
+
+        # Dashboard monitoring (legado, solo en /monitor)
         port_ok = check_port(8703)
         tg_ok = check_telegram()
         airtable_ok = check_airtable()
@@ -264,11 +293,20 @@ new Chart(document.getElementById('chart'),{{type:'bar',data:{{labels:{json.dump
                 
                 if raw_data and len(raw_data) > 0:
                     df = pd.DataFrame(raw_data, columns=headers)
+                    # El navegador manda todo como texto: sin coerción, pandas ve
+                    # columnas object y el motor clasifica el dataset como cualitativo
+                    # (analizaba "Alcohol" como si fuera una categoría).
+                    for col in list(df.columns):
+                        serie = df[col].astype(str).str.strip().str.replace(",", ".", regex=False)
+                        num = pd.to_numeric(serie, errors="coerce")
+                        if num.notna().mean() >= 0.9:
+                            df[col] = num
                     result = generate_insights(df, filters=filters, total_count=total_unfiltered)
                     prompt = result["prompt"]
                     
                     analysis = self._call_llm(prompt, 1500)
                     analysis = analysis.replace("```html", "").replace("```", "").strip()
+                    analysis = self._pretty_analysis(analysis)
                     
                     # Build metric summary from result
                     metrics = result.get("metrics", {})
@@ -288,6 +326,45 @@ new Chart(document.getElementById('chart'),{{type:'bar',data:{{labels:{json.dump
                                     for k, v in items
                                 )
                                 infographics.append(f'<div class="inf-section"><h4>Distribución: {col["name"]}</h4>{bars}</div>')
+                    elif data_type == "descriptive":
+                        desc = metrics.get("descriptive", {})
+                        # reparto por grupos (class, tipo...)
+                        for cat in desc.get("categorical", [])[:2]:
+                            items = list(cat.get("counts", {}).items())[:10]
+                            maxv = max([v for _, v in items], default=1) or 1
+                            bars = "".join(
+                                f'<div class="inf-bar"><span class="inf-label">{k}</span>'
+                                f'<div class="inf-track"><div class="inf-fill" style="width:{v / maxv * 100}%;background:#6366f1"></div></div>'
+                                f'<span class="inf-num">{v}</span></div>'
+                                for k, v in items
+                            )
+                            infographics.append(
+                                f'<div class="inf-section"><h4>Registros por {cat["name"]}</h4>{bars}</div>'
+                            )
+                        # medias por grupo de las variables que más discriminan
+                        for g in desc.get("group_means", [])[:3]:
+                            filas = " · ".join(f"<strong>{k}</strong>: {v}" for k, v in g["means"].items())
+                            infographics.append(
+                                f'<div class="inf-section"><h4>{g["feature"]} por {g["category_col"]}</h4>'
+                                f'<div class="inf-detail">{filas}</div></div>'
+                            )
+                        # resumen de variables numéricas
+                        feats = desc.get("features", [])[:8]
+                        if feats:
+                            head = ('<tr>' + ''.join(
+                                f'<th style="text-align:left;padding:4px 8px;font-size:.7rem;color:#a0a0b8;border-bottom:1px solid #2a2a3a">{h}</th>'
+                                for h in ("Variable", "Media", "Mín", "Máx")) + '</tr>')
+                            body = "".join(
+                                '<tr>' + ''.join(
+                                    f'<td style="padding:4px 8px;font-size:.72rem;color:#d4d4d8;border-bottom:1px solid #1e1e2e">{v}</td>'
+                                    for v in (f["name"], f["mean"], f["min"], f["max"])) + '</tr>'
+                                for f in feats
+                            )
+                            infographics.append(
+                                '<div class="inf-section" style="grid-column:1/-1"><h4>Resumen de variables</h4>'
+                                f'<table style="width:100%;border-collapse:collapse">{head}{body}</table></div>'
+                            )
+
                     else:
                         c = metrics.get("concentration")
                         if c:
@@ -329,6 +406,17 @@ new Chart(document.getElementById('chart'),{{type:'bar',data:{{labels:{json.dump
                     # Add metrics detail (collapsible for transparency)
                     metrics = result.get("metrics", {})
                     details = []
+                    if metrics.get("descriptive"):
+                        desc = metrics["descriptive"]
+                        cols = ", ".join(c["name"] for c in desc.get("categorical", [])[:3]) or "ninguna"
+                        top = desc.get("features", [])[:3]
+                        detalle = " · ".join(f"{f['name']} (media {f['mean']}, CV {f['cv']})" for f in top)
+                        details.append(f"<p><strong>Dataset:</strong> {desc.get('n_rows', 0)} filas · "
+                                       f"{desc.get('n_features', 0)} variables numéricas · faltantes {desc.get('missing_pct', 0)}% · "
+                                       f"columnas de grupo: {cols}</p>")
+                        if detalle:
+                            details.append(f"<p><strong>Variables más dispersas:</strong> {detalle}</p>")
+
                     if metrics.get("concentration"):
                         c = metrics["concentration"]
                         risk = "⚠️ Alto riesgo" if c.get("is_high_risk") else "✅ Riesgo moderado"
@@ -374,6 +462,6 @@ new Chart(document.getElementById('chart'),{{type:'bar',data:{{labels:{json.dump
         self.end_headers()
 
 if __name__ == "__main__":
-    srv = http.server.HTTPServer(("0.0.0.0", PORT), Handler)
+    srv = http.server.HTTPServer((os.environ.get("BIND_HOST", "0.0.0.0"), PORT), Handler)
     print(f"BMOPS Dashboard Pro → http://0.0.0.0:{PORT}")
     srv.serve_forever()
